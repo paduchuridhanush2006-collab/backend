@@ -1,8 +1,28 @@
 from flask import Blueprint, request, jsonify, current_app
 import requests
 from flask_jwt_extended import jwt_required
+from datetime import datetime
 
 weather_bp = Blueprint('weather', __name__)
+
+def get_owm_icon(icon_name):
+    """Map Pirate Weather icon names to OpenWeatherMap icon codes."""
+    mapping = {
+        'clear-day': '01d',
+        'clear-night': '01n',
+        'rain': '10d',
+        'snow': '13d',
+        'sleet': '13d',
+        'wind': '50d',
+        'fog': '50d',
+        'cloudy': '03d',
+        'partly-cloudy-day': '02d',
+        'partly-cloudy-night': '02n',
+        'hail': '13d',
+        'thunderstorm': '11d',
+        'tornado': '50d'
+    }
+    return mapping.get(icon_name, '01d') # Default to clear day
 
 @weather_bp.route('', methods=['GET'])
 @jwt_required()
@@ -12,59 +32,70 @@ def get_weather():
         return jsonify({'message': 'City parameter is required'}), 400
     
     api_key = current_app.config['WEATHER_API_KEY']
-    base_url = current_app.config['WEATHER_API_BASE_URL']
-
-    # Current Weather
-    current_url = f"{base_url}/weather?q={city}&appid={api_key}&units=metric"
-    current_res = requests.get(current_url)
     
-    if current_res.status_code != 200:
-        return jsonify({'message': 'City not found or API error'}), current_res.status_code
-    
-    current_data = current_res.json()
-
-    # 5-Day Forecast
-    forecast_url = f"{base_url}/forecast?q={city}&appid={api_key}&units=metric"
-    forecast_res = requests.get(forecast_url)
-    
-    if forecast_res.status_code != 200:
-        return jsonify({'message': 'Error fetching forecast'}), forecast_res.status_code
+    # 1. Geocoding (using Open-Meteo free API)
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json"
+    try:
+        geo_res = requests.get(geo_url)
+        geo_data = geo_res.json()
         
-    forecast_data = forecast_res.json()
-
-    # Process Forecast
-    daily_forecasts = []
-    seen_dates = set()
-    
-    for item in forecast_data['list']:
-        date_txt = item['dt_txt'].split(' ')[0]
-        
-        if date_txt not in seen_dates:
-            seen_dates.add(date_txt)
-            daily_forecasts.append({
-                "date": date_txt,
-                "temp": round(item['main']['temp']),
-                "description": item['weather'][0]['description'],
-                "icon": item['weather'][0]['icon']
-            })
+        if not geo_data.get('results'):
+            return jsonify({'message': 'City not found'}), 404
             
-    # Limit to 5 days
-    daily_forecasts = daily_forecasts[:5]
+        location = geo_data['results'][0]
+        lat = location['latitude']
+        lon = location['longitude']
+        city_name = location['name']
+        country = location.get('country', '')
+        
+    except Exception as e:
+        return jsonify({'message': 'Error finding city location'}), 500
 
-    response = {
-        "city": {
-            "name": current_data['name'],
-            "country": current_data['sys']['country']
-        },
-        "current": {
-            "temp": round(current_data['main']['temp']),
-            "feels_like": round(current_data['main']['feels_like']),
-            "humidity": current_data['main']['humidity'],
-            "wind_speed": current_data['wind']['speed'],
-            "description": current_data['weather'][0]['description'],
-            "icon": current_data['weather'][0]['icon']
-        },
-        "forecast": daily_forecasts
-    }
+    # 2. Pirate Weather API Call
+    weather_url = f"https://api.pirateweather.net/forecast/{api_key}/{lat},{lon}?units=si&exclude=minutely,hourly"
+    
+    try:
+        weather_res = requests.get(weather_url)
+        if weather_res.status_code != 200:
+            return jsonify({'message': 'Error fetching weather data'}), weather_res.status_code
+            
+        data = weather_res.json()
+        
+        # 3. Process Forecast (Daily)
+        daily_forecasts = []
+        
+        # Pirate Weather 'daily' block
+        if 'daily' in data and 'data' in data['daily']:
+            for item in data['daily']['data'][:5]: # Get next 5 entries
+                # Convert timestamp to date string YYYY-MM-DD
+                date_txt = datetime.fromtimestamp(item['time']).strftime('%Y-%m-%d')
+                
+                daily_forecasts.append({
+                    "date": date_txt,
+                    "temp": round(item.get('temperatureHigh', 0)), # Use high temp for forecast
+                    "description": item.get('summary', 'No description'),
+                    "icon": get_owm_icon(item.get('icon', ''))
+                })
 
-    return jsonify(response), 200
+        # 4. Construct Response
+        current = data['currently']
+        response = {
+            "city": {
+                "name": city_name,
+                "country": country
+            },
+            "current": {
+                "temp": round(current.get('temperature', 0)),
+                "feels_like": round(current.get('apparentTemperature', 0)),
+                "humidity": round(current.get('humidity', 0) * 100), # PW returns 0.76, OWM returns 76
+                "wind_speed": current.get('windSpeed', 0),
+                "description": current.get('summary', 'Clear'),
+                "icon": get_owm_icon(current.get('icon', ''))
+            },
+            "forecast": daily_forecasts
+        }
+
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({'message': f'Weather API Error: {str(e)}'}), 500
